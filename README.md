@@ -35,9 +35,5 @@ Licensed under **Apache-2.0**, community contributions are welcome!
 - [CMake 3.20+](https://cmake.org/)
 
 #### Build
-```bash
-git clone https://github.com/yourname/arabic-ocr.git
-cd arabic-ocr
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+
+TODO

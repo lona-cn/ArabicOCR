@@ -37,34 +37,19 @@
 
 #### خطوات البناء (مثال)
 ~~~bash
-git clone https://github.com/yourname/arabic-ocr.git
-cd arabic-ocr
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --parallel
-# ستجد الملفات الثنائية في build/bin/
+TODO
 ~~~
 
 ### الاستخدام
 
 #### سطر الأوامر
 ~~~bash
-./build/bin/arabic_ocr path/to/input.jpg
+TODO
 ~~~
 
 #### مثال واجهة C++
 ~~~cpp
-#include "ocr/ocr.h"
-
-int main() {
-    OCR::ModelOptions opts;
-    opts.model_path = "models/arabic_recog.onnx";
-    OCR::Engine engine(opts);
-
-    std::string text = engine.recognize_from_file("test_images/page1.jpg");
-    std::cout << text << std::endl;
-    return 0;
-}
+TODO
 ~~~
 
 ### النماذج
