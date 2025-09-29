@@ -1,0 +1,5 @@
+includes(path.join("source", "requires.lua"))
+IncludeSubDirs(path.join(os.scriptdir(), "source"))
+IncludeSubDirs(path.join(os.scriptdir(), "source", "third"))
+IncludeSubDirs(path.join(os.scriptdir(), "source", "runtime"))
+IncludeSubDirs(path.join(os.scriptdir(), "source", "programs"))
