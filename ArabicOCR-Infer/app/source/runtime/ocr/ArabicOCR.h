@@ -22,6 +22,11 @@
     ARABIC_OCR_DISALLOW_MOVE(CLASS);
 
 
+namespace cv
+{
+    class Mat;
+}
+
 namespace arabic_ocr
 {
     enum class ErrorCode:uint8_t
@@ -67,13 +72,20 @@ namespace arabic_ocr
     template <typename T>
     using Result = std::expected<T, Error>;
 
+    struct TextBox
+    {
+        float x, y, width, height;
+        float confidence;
+        std::string text;
+    };
+
     template <typename T, typename String = const char*>
         requires(std::convertible_to<String, std::string>)
     Result<T> MakeError(ErrorCode error_code, String&& msg = "")
     {
         return std::unexpected(Error{error_code, std::forward<String>(msg)});
     }
-    
+
 
     class InferContext
     {
@@ -82,7 +94,7 @@ namespace arabic_ocr
             Backend backend = Backend::kORT, EP ep = EP::kCPU) noexcept;
 
         static std::expected<std::unique_ptr<InferContext>, ErrorCode> Create(
-            Backend backend = Backend::kORT, const std::vector<EP>& eps = {}) noexcept
+            Backend backend, const std::vector<EP>& eps) noexcept
         {
             for (const auto& ep : eps)
             {
@@ -96,7 +108,7 @@ namespace arabic_ocr
 
         InferContext() = default;
         ARABIC_OCR_DISALLOW_COPY_MOVE(InferContext)
-        virtual ~InferContext() noexcept = 0;
+        virtual ~InferContext() noexcept;
     };
 
     class OCR
@@ -113,6 +125,9 @@ namespace arabic_ocr
             const std::string& rec_model_path) noexcept;
         OCR() noexcept = default;
         ARABIC_OCR_DISALLOW_COPY_MOVE(OCR)
-        virtual ~OCR() noexcept = 0;
+        virtual ~OCR() noexcept;
+
+
+        virtual std::vector<TextBox> BatchOCR(const std::vector<cv::Mat>& images) noexcept = 0;
     };
 }

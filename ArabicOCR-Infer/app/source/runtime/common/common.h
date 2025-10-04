@@ -38,5 +38,5 @@ private:
   ~AppBuildInfo();
 };
 
-int FALCONOCR_INFER_EXPORT add(int a, int b);
+int ARABIC_INFER_EXPORT add(int a, int b);
 } // namespace common
