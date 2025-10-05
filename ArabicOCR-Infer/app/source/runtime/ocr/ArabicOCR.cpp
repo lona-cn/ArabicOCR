@@ -1,13 +1,17 @@
 #include "ArabicOCR.h"
 #include <filesystem>
+#include <iostream>
 #include <limits>
+#include <map>
+#include <algorithm>
+#include <numeric>
 
 #include <onnxruntime_cxx_api.h>
 #include <onnxruntime_float16.h>
 #include <onnxruntime_session_options_config_keys.h>
 #include <onnxruntime_run_options_config_keys.h>
 
-#ifdef FALCON_OCR_ONNX_ENABLED
+#ifdef ARABIC_OCR_ONNX_ENABLED
 #include <onnx/onnx_pb.h>
 #endif
 #ifdef WIN32
@@ -15,17 +19,40 @@
 #endif
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
 #include <mio/mmap.hpp>
+#include <magic_enum/magic_enum.hpp>
+
+#include "VisionHelper.hpp"
 
 namespace
 {
-#ifdef FALCON_OCR_ONNX_ENABLED
+    inline std::vector<std::string> REC_DICT{
+        "",
+        "!", "#", "$", "%", "&", "'", "(", "+", ",", "-", ".", "/",
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        ":", "?", "@",
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+        "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+        "_",
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+        "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+        "É", "é",
+        "ء", "آ", "أ", "ؤ", "إ", "ئ", "ا", "ب", "ة", "ت", "ث", "ج", "ح", "خ", "د", "ذ",
+        "ر", "ز", "س", "ش", "ص", "ض", "ط", "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن",
+        "ه", "و", "ى", "ي",
+        "ً", "ٌ", "ٍ", "َ", "ُ", "ِ", "ّ", "ْ", "ٓ", "ٔ", "ٰ", "ٱ",
+        "ٹ", "پ", "چ", "ڈ", "ڑ", "ژ", "ک", "ڭ", "گ", "ں", "ھ", "ۀ", "ہ", "ۂ", "ۃ",
+        "ۆ", "ۇ", "ۈ", "ۋ", "ی", "ې", "ے", "ۓ", "ە",
+        "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩", "UNK"
+    };
+#ifdef ARABIC_OCR_ONNX_ENABLED
     void CreateResizeModel(size_t num_channel, size_t width, size_t height)
     {
         onnx::ModelProto model;
         model.set_ir_version(onnx::IR_VERSION);
         model.set_producer_name(
-            std::format("FalconOCR-ResizeTo-{}*{}*{}", num_channel, width, height));
+            std::format("ArabicOCR-ResizeTo-{}*{}*{}", num_channel, width, height));
         auto graph = model.mutable_graph();
         graph->set_name("resize_graph");
         auto* input = graph->add_input();
@@ -34,6 +61,14 @@ namespace
         // input->mutable_type()->mutable_tensor_type()->
     }
 #endif
+    struct DBPostProcessParams
+    {
+        float bin_thresh = 0.3f; // 二值化阈值 (thresh)
+        float box_thresh = 0.6f; // 框置信度阈值
+        int max_candidates = 1000; // 最大候选框
+        float unclip_ratio = 1.5f; // 膨胀因子 (unclip_ratio)
+    };
+
     cv::Mat LetterBox(const cv::Mat& image, const cv::Size new_shape,
                       const cv::Scalar& color = cv::Scalar(0, 0, 0))
     {
@@ -63,138 +98,83 @@ namespace
         return result;
     }
 
+    template <class T>
+    T align_up(T value, T align)
+    {
+        static_assert(std::is_integral_v<T>, "align_up only works with integral types");
+        return (value + align - 1) / align * align;
+    }
+
+
+    template <typename T>
+    void HWC2CHW(const cv::Mat& from, T* to) noexcept
+    {
+        cv::Mat img;
+        // force 32FC3
+        if (from.type() == CV_32FC3)img = from;
+        else from.convertTo(img,CV_32FC3);
+
+        std::vector<cv::Mat> channels_{3};
+        size_t width = img.cols, height = img.rows;
+        cv::split(img, channels_);
+        const size_t num_pixels = width * height;
+        for (int c = 0; c < 3; ++c)
+        {
+            constexpr int channel_mapper[3] = {0, 1, 2};
+            const auto src = channels_[channel_mapper[c]].data;
+            auto dst = to + num_pixels * c;
+            std::memcpy(dst, src, num_pixels * sizeof(T));
+        }
+    }
+
+    template <typename T>
+    void HWC2CHW_BGR2RGB(const cv::Mat& from, T* to) noexcept
+    {
+        cv::Mat img;
+        // force 32FC3
+        if (from.type() == CV_32FC3)img = from;
+        else from.convertTo(img,CV_32FC3);
+
+        std::vector<cv::Mat> channels_{3};
+        size_t width = img.cols, height = img.rows;
+        cv::split(img, channels_);
+        const size_t num_pixels = width * height;
+        for (int c = 0; c < 3; ++c)
+        {
+            constexpr int channel_mapper[3] = {2, 1, 0};
+            const auto src = channels_[channel_mapper[c]].data;
+            auto dst = to + num_pixels * c;
+            std::memcpy(dst, src, num_pixels * sizeof(T));
+        }
+    }
 
     // 将 HWC 的 cv::Mat 转换为 CHW，并写入 Ort::Value
     [[nodiscard]] Ort::Value MatToTensorCHW(const cv::Mat& image, const Ort::MemoryInfo& memory_info)
     {
-        // 确保图像是连续的
-        cv::Mat img;
-        if (!image.isContinuous())
-        {
-            img = image.clone();
-        }
-        else
-        {
-            img = image;
-        }
+        auto height = align_up(image.rows, 32);
+        auto width = align_up(image.cols, 32);
+        cv::Mat img = LetterBox(image, {width, height});
+        if (!img.isContinuous())img = img.clone();
 
-        int height = img.rows;
-        int width = img.cols;
+        img.convertTo(img, img.type(), 1.0f / 255.f);
+        cv::Scalar mean(0.485, 0.456, 0.406); // BGR 顺序
+        cv::Scalar std(0.229, 0.224, 0.225);
+        cv::subtract(img, mean, img);
+        cv::divide(img, std, img);
+
         int channels = img.channels();
-
         // 创建存放 CHW 数据的 buffer
-        std::vector<float> chw_data(channels * height * width);
-
-        // HWC -> CHW
-        const unsigned char* hwc_data = img.ptr<unsigned char>(0);
-        size_t hwc_index = 0;
-
-        for (int h = 0; h < height; ++h)
-        {
-            for (int w = 0; w < width; ++w)
-            {
-                for (int c = 0; c < channels; ++c)
-                {
-                    size_t chw_index = c * height * width + h * width + w;
-                    chw_data[chw_index] = static_cast<float>(hwc_data[hwc_index++]) / 255.0f; // 归一化到[0,1]
-                }
-            }
-        }
-
+        // 创建 Ort::Value (tensor)
         // ONNX Runtime tensor shape: NCHW (batch=1)
         std::array<int64_t, 4> input_shape{1, channels, height, width};
-
-        // 创建 Ort::Value (tensor)
+        Ort::AllocatorWithDefaultOptions allocator;
         Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-            memory_info,
-            chw_data.data(),
-            chw_data.size(),
-            input_shape.data(),
-            input_shape.size()
+            allocator, input_shape.data(), input_shape.size()
         );
-
-        return input_tensor;
-    }
-
-    Ort::Value MatToTensorCHW(const std::vector<cv::Mat>& images,
-                              const Ort::MemoryInfo& memory_info,
-                              cv::Size size = {-1, -1})
-    {
-        if (images.empty())
-        {
-            throw std::invalid_argument("Input images vector is empty");
-        }
-
-        // 1. 确定目标尺寸
-        int target_h = size.height;
-        int target_w = size.width;
-
-        if (target_h == -1 || target_w == -1)
-        {
-            target_h = images[0].rows;
-            target_w = images[0].cols;
-            for (const auto& img : images)
-            {
-                target_h = std::min(target_h, img.rows);
-                target_w = std::min(target_w, img.cols);
-            }
-        }
-
-        int channels = images[0].channels();
-        int batch_size = static_cast<int>(images.size());
-
-        // 2. 分配批量 CHW buffer
-        std::vector<float> chw_data(batch_size * channels * target_h * target_w);
-
-        // 3. 转换每张图片
-        for (int n = 0; n < batch_size; ++n)
-        {
-            cv::Mat img = images[n];
-
-            // 转换为连续存储
-            if (!img.isContinuous())
-            {
-                img = img.clone();
-            }
-
-            // resize
-            if (img.rows != target_h || img.cols != target_w)
-            {
-                cv::resize(img, img, cv::Size(target_w, target_h));
-            }
-
-            // HWC -> CHW
-            const unsigned char* hwc_data = img.ptr<unsigned char>(0);
-            for (int h = 0; h < target_h; ++h)
-            {
-                for (int w = 0; w < target_w; ++w)
-                {
-                    for (int c = 0; c < channels; ++c)
-                    {
-                        size_t chw_index =
-                            n * (channels * target_h * target_w) +
-                            c * (target_h * target_w) +
-                            h * target_w + w;
-
-                        size_t hwc_index = h * (target_w * channels) + w * channels + c;
-
-                        chw_data[chw_index] = static_cast<float>(hwc_data[hwc_index]) / 255.0f; // normalize
-                    }
-                }
-            }
-        }
-
-        // 4. 构造 Ort::Value (tensor), shape = [N, C, H, W]
-        std::array<int64_t, 4> input_shape{batch_size, channels, target_h, target_w};
-
-        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-            memory_info,
-            chw_data.data(),
-            chw_data.size(),
-            input_shape.data(),
-            input_shape.size()
-        );
-
+        auto info = input_tensor.GetTensorTypeAndShapeInfo();
+        // HWC -> CHW
+        auto chw_data = input_tensor.GetTensorMutableData<float>();
+        HWC2CHW(img, chw_data);
         return input_tensor;
     }
 
@@ -238,11 +218,11 @@ namespace
         {
             Ort::SessionOptions session_options{};
             // common options
+            if (true)
             {
                 session_options.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
                 session_options.DisableProfiling();
                 session_options.DisablePerSessionThreads();
-                session_options.EnableOrtCustomOps();
                 session_options.AddConfigEntry(kOrtSessionOptionsConfigUseEnvAllocators, "1");
                 session_options.AddConfigEntry(kOrtSessionOptionsConfigAllowInterOpSpinning, "0");
                 session_options.AddConfigEntry(kOrtSessionOptionsConfigAllowIntraOpSpinning, "0");
@@ -287,13 +267,6 @@ namespace
         arabic_ocr::EP ep_;
     };
 
-    struct TextBox
-    {
-        float x, y, width, height;
-        float confidence;
-        std::string text;
-    };
-
     class PPOCRv5 : public arabic_ocr::OCR
     {
         PPOCRv5(std::unique_ptr<Ort::Session> det_session,
@@ -303,22 +276,23 @@ namespace
                                          rec_session_(std::move(rec_session)),
                                          det_io_(std::move(det_io)),
                                          rec_io_(std::move(rec_io)),
-                                         model_shape_info{}
+                                         model_shape_info_{}
         {
             // det model shape info
             {
                 auto ts_info = det_session_->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
-                model_shape_info.det_input_element_type = ts_info.GetElementType();
-                model_shape_info.det_input_num_channels = ts_info.GetShape()[1];
+                model_shape_info_.det_input_element_type = ts_info.GetElementType();
+                model_shape_info_.det_input_num_channels = ts_info.GetShape()[1];
             }
             // rec model shape info
             {
                 auto ts_info = rec_session_->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
-                model_shape_info.rec_input_element_type = ts_info.GetElementType();
-                model_shape_info.rec_input_num_channels = ts_info.GetShape()[1];
-                model_shape_info.rec_input_height = ts_info.GetShape()[2];
-                model_shape_info.rec_output_num_classes = rec_session_->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo()
-                                                                      .GetShape()[2];
+                model_shape_info_.rec_input_element_type = ts_info.GetElementType();
+                model_shape_info_.rec_input_num_channels = ts_info.GetShape()[1];
+                model_shape_info_.rec_input_height = ts_info.GetShape()[2];
+                model_shape_info_.rec_output_num_classes = rec_session_
+                                                           ->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo()
+                                                           .GetShape()[2];
             }
         }
 
@@ -333,8 +307,8 @@ namespace
         };
 
     public:
-        arabic_ocr::Result<std::unique_ptr<PPOCRv5>> Create(std::unique_ptr<Ort::Session> det_session,
-                                                            std::unique_ptr<Ort::Session> rec_session)
+        static arabic_ocr::Result<std::unique_ptr<PPOCRv5>> Create(std::unique_ptr<Ort::Session> det_session,
+                                                                   std::unique_ptr<Ort::Session> rec_session)
         {
             if (!det_session)
                 return std::unexpected(arabic_ocr::Error{
@@ -344,8 +318,8 @@ namespace
                 return std::unexpected(arabic_ocr::Error{
                     arabic_ocr::ErrorCode::kParameterError, "invalid rec session"
                 });
-            Ort::IoBinding det_io{*det_session_};
-            Ort::IoBinding rec_io{*rec_session_};
+            Ort::IoBinding det_io{*det_session};
+            Ort::IoBinding rec_io{*rec_session};
             {
                 // Ort::UnownedIoBinding det_io{};
                 auto setup_output = [](const Ort::Session& session, const Ort::MemoryInfo& memory_info,
@@ -363,6 +337,8 @@ namespace
                         io.BindOutput(name.data(), memory_info);
                     }
                 };
+                Ort::MemoryInfo output_mem_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator,
+                                                                             OrtMemType::OrtMemTypeCPUOutput);
                 setup_output(*det_session, output_mem_info, det_io);
                 setup_output(*rec_session, output_mem_info, rec_io);
             }
@@ -376,43 +352,257 @@ namespace
 
         ~PPOCRv5() noexcept override = default;
 
-        std::vector<cv::Mat> BatchDet(const std::vector<cv::Mat>& images) noexcept
+        std::vector<std::vector<arabic_ocr::TextBox>> BatchOCR(const std::vector<cv::Mat>& images) noexcept override
         {
             if (images.empty()) return {};
-            // auto is_same_size = std::ranges::all_of(images, [w=images[0].cols,h = images[0].rows](const auto& image)
-            // {
-            //     return image.rows == w && image.cols == h;
-            // });
+            Ort::MemoryInfo input_mem_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator,
+                                                                        OrtMemType::OrtMemTypeCPUInput);
+            std::vector<std::vector<arabic_ocr::TextBox>> ocr_result;
             for (auto& image : images)
             {
                 auto tensor{MatToTensorCHW(image, input_mem_info)};
                 det_io_.BindInput("x", tensor);
-                Ort::RunOptions run_options;
-                det_session_->Run(run_options, det_io_);
+                try
+                {
+                    Ort::RunOptions run_options;
+                    det_session_->Run(run_options, det_io_);
+                }
+                catch (std::exception& err)
+                {
+                    throw;
+                }
+                std::vector<cv::Rect> boxes;
+                {
+                    auto outputs = det_io_.GetOutputValues();
+                    //TODO: detect outputs shape
+                    auto& output = outputs[0];
+                    auto type_and_shape_info = output.GetTensorTypeAndShapeInfo();
+                    if (output.GetTensorTypeAndShapeInfo().GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+                    {
+                        throw std::runtime_error(
+                            std::format("unsupported data type:{}",
+                                        magic_enum::enum_name(output.GetTensorTypeAndShapeInfo().GetElementType())));
+                    }
+                    // force data as float
+                    auto shape = type_and_shape_info.GetShape();
+                    cv::Mat pred_img{
+                        cv::Size{static_cast<int>(shape[3]), static_cast<int>(shape[2])},CV_32FC1,
+                        output.GetTensorMutableData<float>()
+                    };
+                    DBPostProcessParams db_post_process_params;
+                    // cv::Mat output_u8_img;
+                    // output_img.convertTo(output_u8_img, CV_8UC1, 255.0);
+                    // std::vector<std::vector<cv::Point>> contours;
+                    // cv::findContours(output_u8_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                    auto contours = DBPostProcess(pred_img, db_post_process_params);
+
+                    boxes.reserve(contours.size());
+                    for (const auto& contour : contours)
+                    {
+                        cv::Rect box = cv::boundingRect(contour);
+                        auto origin_box = vision_simple::VisionHelper::ScaleCoords(pred_img.size(),
+                            box, image.size(), true);
+                        if (box.width > 3 && box.height > 3 && box.area() > 12)
+                            boxes.emplace_back(origin_box);
+                    }
+                }
+                std::ranges::sort(boxes, [](const auto& lhs, const auto& rhs)
+                {
+                    return lhs.area() > rhs.area();
+                });
+                // rec
+                {
+                    auto last_boxes = vision_simple::VisionHelper::FilterByIOU(boxes, 0.4);
+                    auto imgs = last_boxes | std::views::transform([&image](const cv::Rect& box)
+                    {
+                        return image(box);
+                    }) | std::ranges::to<std::vector>();
+                    auto rec_results = BatchRec(imgs);
+                    std::vector<arabic_ocr::TextBox> result;
+                    for (const auto& [i,box] : std::views::enumerate(last_boxes))
+                    {
+                        auto& rec = rec_results[i];
+                        result.emplace_back(box.x, box.y, box.width, box.height, rec.confidence, rec.text);
+                    }
+                    ocr_result.emplace_back(std::move(result));
+                }
+            }
+            return ocr_result;
+        }
+
+        std::vector<arabic_ocr::RecResult> BatchRec(const std::vector<cv::Mat>& images) noexcept override
+        {
+            auto height = this->model_shape_info_.rec_input_height;
+            auto max_height = std::ranges::max_element(
+                images, [](const auto& lhs, const auto& rhs)-> bool
+                {
+                    return lhs.rows < rhs.rows;
+                })->rows;
+            auto scale = (float)height / (float)max_height;
+            auto width = align_up((int)(std::ranges::max_element(
+                                      images, [](const auto& lhs, const auto& rhs)-> bool
+                                      {
+                                          return lhs.cols < rhs.cols;
+                                      })->cols * scale), 320);
+            {
+                // images
+                std::vector<int64_t> rec_shape{
+                    static_cast<int64_t>(images.size()),
+                    this->model_shape_info_.rec_input_num_channels, height, width
+                };
+
+                Ort::AllocatorWithDefaultOptions allocator;
+                Ort::Value rec_input_tensor = Ort::Value::CreateTensor(
+                    allocator, rec_shape.data(), rec_shape.size(),
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+                auto dst = rec_input_tensor.GetTensorMutableData<float>();
+                auto stride = width * height;
+                for (const auto& [index,image] : std::views::enumerate(images))
+                {
+                    auto img = LetterBox(image, {width, static_cast<int>(height)});
+                    HWC2CHW(img, dst + stride * index);
+                }
+                rec_io_.BindInput("x", rec_input_tensor);
+                Ort::RunOptions run_options{};
                 rec_session_->Run(run_options, rec_io_);
             }
-        }
-
-        std::vector<TextBox> BatchRec(const std::vector<cv::Mat>& images) noexcept
-        {
-        }
-
-        std::vector<TextBox> BatchOCR(const std::vector<cv::Mat>& images) noexcept
-        {
-            BatchDet(images);
+            // post process
+            auto rec_outputs = rec_io_.GetOutputValues();
+            auto& value = rec_outputs[0];
+            auto info = value.GetTensorTypeAndShapeInfo();
+            auto shape = info.GetShape();
+            // auto type = magic_enum::enum_name(info.GetElementType());
+            auto ptr = value.GetTensorData<float>();
+            auto stride = shape[1] * shape[2];
+            std::vector<std::vector<std::pair<int, float>>> result;
+            for (auto i : std::views::iota(0, shape[0]))
+            {
+                std::vector<std::pair<int, float>> indices;
+                auto img_ptr = ptr + i * stride;
+                for (auto k : std::views::iota(0, shape[1]))
+                {
+                    auto base_ptr = img_ptr + k * shape[2];
+                    auto idx = static_cast<int>(std::ranges::max_element(base_ptr, base_ptr + shape[2]) -
+                        base_ptr);
+                    auto conf = base_ptr[idx];
+                    indices.emplace_back(idx, conf);
+                }
+                result.emplace_back(std::move(indices));
+            }
+            std::vector<arabic_ocr::RecResult> rec_results;
+            rec_results.reserve(result.size());
+            for (auto [i,v] : std::views::enumerate(result))
+            {
+                for (auto it = v.begin(); it != v.end();)
+                {
+                    if (it->second < 0.3f)
+                        it = v.erase(it);
+                    else
+                        ++it;
+                }
+                auto conf_view = v | std::views::transform([](auto& p) { return p.second; });
+                auto avg_conf = std::accumulate(conf_view.begin(), conf_view.end(), 0.f) / conf_view.size();
+                auto view = v | std::views::transform([](auto& p) { return REC_DICT[p.first]; });
+                auto str = std::accumulate(view.begin(), view.end(), std::string{});
+                rec_results.emplace_back(avg_conf, str);
+            }
+            return rec_results;
         }
 
     private:
+        // 计算多边形面积
+        static double polygonArea(const std::vector<cv::Point>& poly)
+        {
+            return fabs(cv::contourArea(poly));
+        }
+
+        // 计算框在概率图上的平均置信度
+        static float boxScoreFast(const std::vector<cv::Point>& contour, const cv::Mat& pred)
+        {
+            cv::Rect rect = cv::boundingRect(contour);
+            rect &= cv::Rect(0, 0, pred.cols, pred.rows);
+
+            cv::Mat mask = cv::Mat::zeros(rect.size(), CV_8UC1);
+            std::vector<std::vector<cv::Point>> c(1);
+            for (auto& p : contour) c[0].push_back(p - rect.tl());
+            cv::drawContours(mask, c, 0, cv::Scalar(1), cv::FILLED);
+
+            cv::Mat roi = pred(rect);
+            return (float)cv::mean(roi, mask)[0];
+        }
+
+        // 对检测框进行膨胀 (近似的 unclip 实现)
+        static std::vector<cv::Point> unclip(const std::vector<cv::Point>& contour, float unclip_ratio)
+        {
+            double area = fabs(cv::contourArea(contour));
+            double length = cv::arcLength(contour, true);
+            double distance = area * unclip_ratio / length;
+
+            std::vector<cv::Point2f> contour2f;
+            for (auto& p : contour) contour2f.push_back((cv::Point2f)p);
+
+            std::vector<cv::Point> result;
+            cv::Mat offset;
+            cv::Mat(contour2f).convertTo(offset, CV_32F);
+
+            // 用膨胀核来近似 polygon offset（更严谨的做法是 pyclipper）
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                                       cv::Size((int)(2 * distance + 1), (int)(2 * distance + 1)));
+            cv::Mat mask = cv::Mat::zeros(cv::boundingRect(contour).size() + cv::Size(20, 20), CV_8UC1);
+            std::vector<std::vector<cv::Point>> c(1);
+            for (auto& p : contour) c[0].push_back(p - cv::boundingRect(contour).tl() + cv::Point(10, 10));
+            cv::drawContours(mask, c, 0, cv::Scalar(255), cv::FILLED);
+
+            cv::dilate(mask, mask, kernel);
+            cv::findContours(mask, c, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            if (!c.empty()) result = c[0];
+            return result;
+        }
+
+        // 主函数
+        static std::vector<std::vector<cv::Point>> DBPostProcess(const cv::Mat& pred, const DBPostProcessParams& params)
+        {
+            std::vector<std::vector<cv::Point>> results;
+
+            // 1. 阈值化
+            cv::Mat binary;
+            cv::threshold(pred, binary, params.bin_thresh, 255., cv::THRESH_BINARY);
+            binary.convertTo(binary, CV_8UC1);
+
+            // 2. 找轮廓
+            std::vector<std::vector<cv::Point>> contours;
+            cv::findContours(binary, contours, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
+
+            // 3. 遍历候选框
+            for (size_t i = 0; i < contours.size() && (int)i < params.max_candidates; i++)
+            {
+                if (polygonArea(contours[i]) < 1.0) continue; // 太小的跳过
+
+                // 3.1 计算置信度
+                float score = boxScoreFast(contours[i], pred);
+                if (score < params.box_thresh) continue;
+
+                // 3.2 膨胀（unclip）
+                std::vector<cv::Point> expanded = unclip(contours[i], params.unclip_ratio);
+                if (expanded.empty()) continue;
+
+                // 3.3 最小外接矩形 (四点)
+                cv::RotatedRect rect = cv::minAreaRect(expanded);
+                cv::Point2f vertices[4];
+                rect.points(vertices);
+
+                std::vector<cv::Point> box;
+                for (int j = 0; j < 4; j++) box.push_back(vertices[j]);
+                results.push_back(box);
+            }
+            return results;
+        }
+
         std::unique_ptr<Ort::Session> det_session_;
         std::unique_ptr<Ort::Session> rec_session_;
         Ort::IoBinding det_io_;
         Ort::IoBinding rec_io_;
-        ModelShapeInfo model_shape_info;
-
-        static inline const auto input_mem_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator,
-                                                                             OrtMemType::OrtMemTypeCPUInput);
-        static inline const auto output_mem_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator,
-                                                                              OrtMemType::OrtMemTypeCPUOutput);
+        ModelShapeInfo model_shape_info_;
     };
 }
 
@@ -429,13 +619,12 @@ std::expected<std::unique_ptr<arabic_ocr::InferContext>, arabic_ocr::ErrorCode> 
     auto cpu_cores = std::max(1u, std::thread::hardware_concurrency());
     threading_options.SetGlobalInterOpNumThreads(std::max(1, static_cast<int>(0.75f * cpu_cores)));
     threading_options.SetGlobalIntraOpNumThreads(std::max(1, static_cast<int>(0.25f * cpu_cores)));
-    //
     threading_options.SetGlobalSpinControl(0);
     threading_options.SetGlobalDenormalAsZero();
     std::unique_ptr<InferContext> ctx =
         std::make_unique<InferContextOrt>(Ort::Env{
                                               threading_options, LoggingForward, nullptr,
-                                              ORT_LOGGING_LEVEL_INFO, "FalconOCR"
+                                              ORT_LOGGING_LEVEL_INFO, "ArabicOCR"
                                           }, ep);
     return std::move(ctx);
 }
@@ -454,6 +643,7 @@ arabic_ocr::Result<std::unique_ptr<arabic_ocr::OCR>> arabic_ocr::OCR::Create(Inf
     auto rec_result = ort_infer_ctx.CreateSession(rec_model_data,
                                                   std::numeric_limits<std::size_t>::max());
     if (!rec_result)return std::unexpected(std::move(rec_result.error()));
+    return PPOCRv5::Create(std::move(det_result.value()), std::move(rec_result.value()));
 }
 
 arabic_ocr::Result<std::unique_ptr<arabic_ocr::OCR>> arabic_ocr::OCR::Create(InferContext& infer_ctx,
@@ -486,4 +676,8 @@ arabic_ocr::Result<std::unique_ptr<arabic_ocr::OCR>> arabic_ocr::OCR::Create(Inf
     return Create(infer_ctx,
                   std::span(reinterpret_cast<const uint8_t*>(det_mmap.data()), det_mmap.size()),
                   std::span(reinterpret_cast<const uint8_t*>(rec_mmap.data()), rec_mmap.size()));
+}
+
+arabic_ocr::OCR::~OCR() noexcept
+{
 }
