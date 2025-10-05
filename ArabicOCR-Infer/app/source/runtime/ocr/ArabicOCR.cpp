@@ -61,6 +61,14 @@ namespace
         // input->mutable_type()->mutable_tensor_type()->
     }
 #endif
+    struct DBPostProcessParams
+    {
+        float bin_thresh = 0.3f; // 二值化阈值 (thresh)
+        float box_thresh = 0.6f; // 框置信度阈值
+        int max_candidates = 1000; // 最大候选框
+        float unclip_ratio = 1.5f; // 膨胀因子 (unclip_ratio)
+    };
+
     cv::Mat LetterBox(const cv::Mat& image, const cv::Size new_shape,
                       const cv::Scalar& color = cv::Scalar(0, 0, 0))
     {
@@ -99,6 +107,27 @@ namespace
 
 
     template <typename T>
+    void HWC2CHW(const cv::Mat& from, T* to) noexcept
+    {
+        cv::Mat img;
+        // force 32FC3
+        if (from.type() == CV_32FC3)img = from;
+        else from.convertTo(img,CV_32FC3);
+
+        std::vector<cv::Mat> channels_{3};
+        size_t width = img.cols, height = img.rows;
+        cv::split(img, channels_);
+        const size_t num_pixels = width * height;
+        for (int c = 0; c < 3; ++c)
+        {
+            constexpr int channel_mapper[3] = {0, 1, 2};
+            const auto src = channels_[channel_mapper[c]].data;
+            auto dst = to + num_pixels * c;
+            std::memcpy(dst, src, num_pixels * sizeof(T));
+        }
+    }
+
+    template <typename T>
     void HWC2CHW_BGR2RGB(const cv::Mat& from, T* to) noexcept
     {
         cv::Mat img;
@@ -126,6 +155,13 @@ namespace
         auto width = align_up(image.cols, 32);
         cv::Mat img = LetterBox(image, {width, height});
         if (!img.isContinuous())img = img.clone();
+
+        img.convertTo(img, img.type(), 1.0f / 255.f);
+        cv::Scalar mean(0.485, 0.456, 0.406); // BGR 顺序
+        cv::Scalar std(0.229, 0.224, 0.225);
+        cv::subtract(img, mean, img);
+        cv::divide(img, std, img);
+
         int channels = img.channels();
         // 创建存放 CHW 数据的 buffer
         // 创建 Ort::Value (tensor)
@@ -138,7 +174,7 @@ namespace
         auto info = input_tensor.GetTensorTypeAndShapeInfo();
         // HWC -> CHW
         auto chw_data = input_tensor.GetTensorMutableData<float>();
-        HWC2CHW_BGR2RGB<float>(img, chw_data);
+        HWC2CHW(img, chw_data);
         return input_tensor;
     }
 
@@ -187,7 +223,6 @@ namespace
                 session_options.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
                 session_options.DisableProfiling();
                 session_options.DisablePerSessionThreads();
-                //session_options.EnableOrtCustomOps();
                 session_options.AddConfigEntry(kOrtSessionOptionsConfigUseEnvAllocators, "1");
                 session_options.AddConfigEntry(kOrtSessionOptionsConfigAllowInterOpSpinning, "0");
                 session_options.AddConfigEntry(kOrtSessionOptionsConfigAllowIntraOpSpinning, "0");
@@ -219,10 +254,9 @@ namespace
             case arabic_ocr::EP::kCPU:
             default:
                 {
-                    session_options.SetExecutionMode(ORT_SEQUENTIAL);
-                    // session_options.SetExecutionMode(ORT_PARALLEL);
-                    // session_options.EnableCpuMemArena();
-                    // session_options.EnableMemPattern();
+                    session_options.SetExecutionMode(ORT_PARALLEL);
+                    session_options.EnableCpuMemArena();
+                    session_options.EnableMemPattern();
                 }
             }
             return std::make_unique<Ort::Session>(env_, model_data.data(), model_data.size_bytes(), session_options);
@@ -242,22 +276,23 @@ namespace
                                          rec_session_(std::move(rec_session)),
                                          det_io_(std::move(det_io)),
                                          rec_io_(std::move(rec_io)),
-                                         model_shape_info{}
+                                         model_shape_info_{}
         {
             // det model shape info
             {
                 auto ts_info = det_session_->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
-                model_shape_info.det_input_element_type = ts_info.GetElementType();
-                model_shape_info.det_input_num_channels = ts_info.GetShape()[1];
+                model_shape_info_.det_input_element_type = ts_info.GetElementType();
+                model_shape_info_.det_input_num_channels = ts_info.GetShape()[1];
             }
             // rec model shape info
             {
                 auto ts_info = rec_session_->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
-                model_shape_info.rec_input_element_type = ts_info.GetElementType();
-                model_shape_info.rec_input_num_channels = ts_info.GetShape()[1];
-                model_shape_info.rec_input_height = ts_info.GetShape()[2];
-                model_shape_info.rec_output_num_classes = rec_session_->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo()
-                                                                      .GetShape()[2];
+                model_shape_info_.rec_input_element_type = ts_info.GetElementType();
+                model_shape_info_.rec_input_num_channels = ts_info.GetShape()[1];
+                model_shape_info_.rec_input_height = ts_info.GetShape()[2];
+                model_shape_info_.rec_output_num_classes = rec_session_
+                                                           ->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo()
+                                                           .GetShape()[2];
             }
         }
 
@@ -327,9 +362,9 @@ namespace
             {
                 auto tensor{MatToTensorCHW(image, input_mem_info)};
                 det_io_.BindInput("x", tensor);
-                Ort::RunOptions run_options;
                 try
                 {
+                    Ort::RunOptions run_options;
                     det_session_->Run(run_options, det_io_);
                 }
                 catch (std::exception& err)
@@ -350,20 +385,22 @@ namespace
                     }
                     // force data as float
                     auto shape = type_and_shape_info.GetShape();
-                    cv::Mat output_img{
+                    cv::Mat pred_img{
                         cv::Size{static_cast<int>(shape[3]), static_cast<int>(shape[2])},CV_32FC1,
                         output.GetTensorMutableData<float>()
                     };
-                    cv::Mat output_u8_img;
-                    output_img.convertTo(output_u8_img, CV_8UC1, 255.0);
-                    std::vector<std::vector<cv::Point>> contours;
-                    cv::findContours(output_u8_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                    DBPostProcessParams db_post_process_params;
+                    // cv::Mat output_u8_img;
+                    // output_img.convertTo(output_u8_img, CV_8UC1, 255.0);
+                    // std::vector<std::vector<cv::Point>> contours;
+                    // cv::findContours(output_u8_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                    auto contours = DBPostProcess(pred_img, db_post_process_params);
 
                     boxes.reserve(contours.size());
                     for (const auto& contour : contours)
                     {
                         cv::Rect box = cv::boundingRect(contour);
-                        auto origin_box = vision_simple::VisionHelper::ScaleCoords(output_u8_img.size(),
+                        auto origin_box = vision_simple::VisionHelper::ScaleCoords(pred_img.size(),
                             box, image.size(), true);
                         if (box.width > 3 && box.height > 3 && box.area() > 12)
                             boxes.emplace_back(origin_box);
@@ -375,19 +412,19 @@ namespace
                 });
                 // rec
                 {
-                    auto last_boxes = vision_simple::VisionHelper::FilterByIOU(boxes, 0.5);
+                    auto last_boxes = vision_simple::VisionHelper::FilterByIOU(boxes, 0.4);
                     auto imgs = last_boxes | std::views::transform([&image](const cv::Rect& box)
                     {
                         return image(box);
                     }) | std::ranges::to<std::vector>();
                     auto rec_results = BatchRec(imgs);
                     std::vector<arabic_ocr::TextBox> result;
-                    for (auto [i,box] : std::views::enumerate(last_boxes))
+                    for (const auto& [i,box] : std::views::enumerate(last_boxes))
                     {
                         auto& rec = rec_results[i];
                         result.emplace_back(box.x, box.y, box.width, box.height, rec.confidence, rec.text);
                     }
-                    ocr_result.emplace_back(result);
+                    ocr_result.emplace_back(std::move(result));
                 }
             }
             return ocr_result;
@@ -395,7 +432,7 @@ namespace
 
         std::vector<arabic_ocr::RecResult> BatchRec(const std::vector<cv::Mat>& images) noexcept override
         {
-            auto height = this->model_shape_info.rec_input_height;
+            auto height = this->model_shape_info_.rec_input_height;
             auto max_height = std::ranges::max_element(
                 images, [](const auto& lhs, const auto& rhs)-> bool
                 {
@@ -411,7 +448,7 @@ namespace
                 // images
                 std::vector<int64_t> rec_shape{
                     static_cast<int64_t>(images.size()),
-                    this->model_shape_info.rec_input_num_channels, height, width
+                    this->model_shape_info_.rec_input_num_channels, height, width
                 };
 
                 Ort::AllocatorWithDefaultOptions allocator;
@@ -423,7 +460,7 @@ namespace
                 for (const auto& [index,image] : std::views::enumerate(images))
                 {
                     auto img = LetterBox(image, {width, static_cast<int>(height)});
-                    HWC2CHW_BGR2RGB(img, dst + stride * index);
+                    HWC2CHW(img, dst + stride * index);
                 }
                 rec_io_.BindInput("x", rec_input_tensor);
                 Ort::RunOptions run_options{};
@@ -434,7 +471,7 @@ namespace
             auto& value = rec_outputs[0];
             auto info = value.GetTensorTypeAndShapeInfo();
             auto shape = info.GetShape();
-            auto type = magic_enum::enum_name(info.GetElementType());
+            // auto type = magic_enum::enum_name(info.GetElementType());
             auto ptr = value.GetTensorData<float>();
             auto stride = shape[1] * shape[2];
             std::vector<std::vector<std::pair<int, float>>> result;
@@ -448,7 +485,6 @@ namespace
                     auto idx = static_cast<int>(std::ranges::max_element(base_ptr, base_ptr + shape[2]) -
                         base_ptr);
                     auto conf = base_ptr[idx];
-                    // it = indices.emplace_hint(it, idx, conf);
                     indices.emplace_back(idx, conf);
                 }
                 result.emplace_back(std::move(indices));
@@ -474,11 +510,99 @@ namespace
         }
 
     private:
+        // 计算多边形面积
+        static double polygonArea(const std::vector<cv::Point>& poly)
+        {
+            return fabs(cv::contourArea(poly));
+        }
+
+        // 计算框在概率图上的平均置信度
+        static float boxScoreFast(const std::vector<cv::Point>& contour, const cv::Mat& pred)
+        {
+            cv::Rect rect = cv::boundingRect(contour);
+            rect &= cv::Rect(0, 0, pred.cols, pred.rows);
+
+            cv::Mat mask = cv::Mat::zeros(rect.size(), CV_8UC1);
+            std::vector<std::vector<cv::Point>> c(1);
+            for (auto& p : contour) c[0].push_back(p - rect.tl());
+            cv::drawContours(mask, c, 0, cv::Scalar(1), cv::FILLED);
+
+            cv::Mat roi = pred(rect);
+            return (float)cv::mean(roi, mask)[0];
+        }
+
+        // 对检测框进行膨胀 (近似的 unclip 实现)
+        static std::vector<cv::Point> unclip(const std::vector<cv::Point>& contour, float unclip_ratio)
+        {
+            double area = fabs(cv::contourArea(contour));
+            double length = cv::arcLength(contour, true);
+            double distance = area * unclip_ratio / length;
+
+            std::vector<cv::Point2f> contour2f;
+            for (auto& p : contour) contour2f.push_back((cv::Point2f)p);
+
+            std::vector<cv::Point> result;
+            cv::Mat offset;
+            cv::Mat(contour2f).convertTo(offset, CV_32F);
+
+            // 用膨胀核来近似 polygon offset（更严谨的做法是 pyclipper）
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                                       cv::Size((int)(2 * distance + 1), (int)(2 * distance + 1)));
+            cv::Mat mask = cv::Mat::zeros(cv::boundingRect(contour).size() + cv::Size(20, 20), CV_8UC1);
+            std::vector<std::vector<cv::Point>> c(1);
+            for (auto& p : contour) c[0].push_back(p - cv::boundingRect(contour).tl() + cv::Point(10, 10));
+            cv::drawContours(mask, c, 0, cv::Scalar(255), cv::FILLED);
+
+            cv::dilate(mask, mask, kernel);
+            cv::findContours(mask, c, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            if (!c.empty()) result = c[0];
+            return result;
+        }
+
+        // 主函数
+        static std::vector<std::vector<cv::Point>> DBPostProcess(const cv::Mat& pred, const DBPostProcessParams& params)
+        {
+            std::vector<std::vector<cv::Point>> results;
+
+            // 1. 阈值化
+            cv::Mat binary;
+            cv::threshold(pred, binary, params.bin_thresh, 255., cv::THRESH_BINARY);
+            binary.convertTo(binary, CV_8UC1);
+
+            // 2. 找轮廓
+            std::vector<std::vector<cv::Point>> contours;
+            cv::findContours(binary, contours, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
+
+            // 3. 遍历候选框
+            for (size_t i = 0; i < contours.size() && (int)i < params.max_candidates; i++)
+            {
+                if (polygonArea(contours[i]) < 1.0) continue; // 太小的跳过
+
+                // 3.1 计算置信度
+                float score = boxScoreFast(contours[i], pred);
+                if (score < params.box_thresh) continue;
+
+                // 3.2 膨胀（unclip）
+                std::vector<cv::Point> expanded = unclip(contours[i], params.unclip_ratio);
+                if (expanded.empty()) continue;
+
+                // 3.3 最小外接矩形 (四点)
+                cv::RotatedRect rect = cv::minAreaRect(expanded);
+                cv::Point2f vertices[4];
+                rect.points(vertices);
+
+                std::vector<cv::Point> box;
+                for (int j = 0; j < 4; j++) box.push_back(vertices[j]);
+                results.push_back(box);
+            }
+            return results;
+        }
+
         std::unique_ptr<Ort::Session> det_session_;
         std::unique_ptr<Ort::Session> rec_session_;
         Ort::IoBinding det_io_;
         Ort::IoBinding rec_io_;
-        ModelShapeInfo model_shape_info;
+        ModelShapeInfo model_shape_info_;
     };
 }
 
