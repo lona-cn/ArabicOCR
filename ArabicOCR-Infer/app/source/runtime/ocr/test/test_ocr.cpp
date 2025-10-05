@@ -13,10 +13,23 @@ int main(int argc, char* argv[])
     auto infer = arabic_ocr::InferContext::Create().value();
     auto ocr = arabic_ocr::OCR::Create(*infer, "assets/det/inference.onnx", "assets/rec/inference.onnx").value();
     cv::Mat mat = cv::imread("assets/imgs/arabic-1.png");
-    auto results = ocr->BatchOCR({std::move(mat)});
+    cv::Mat mat2 = cv::imread("assets/imgs/arabic-2.png");
+    // auto rec_results = ocr->BatchRec({mat2});
+    //
+    // for (auto& result : rec_results)
+    // {
+    //     std::cout << std::format("{} {}", result.confidence, result.text) << std::endl;
+    // }
+
+    // return 0;
+
+    auto results = ocr->BatchOCR({mat});
     for (const auto& result : results)
     {
-        std::cout << std::format("{} {}", result.confidence, result.text) << std::endl;
+        for (const auto& text_box : result)
+        {
+            std::cout << std::format("{} {}", text_box.confidence, text_box.text) << std::endl;
+        }
     }
     return 0;
 }

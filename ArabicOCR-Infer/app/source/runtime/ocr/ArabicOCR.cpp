@@ -27,8 +27,8 @@
 
 namespace
 {
-    inline std::vector<std::string> dict{
-        " ",
+    inline std::vector<std::string> REC_DICT{
+        "",
         "!", "#", "$", "%", "&", "'", "(", "+", ",", "-", ".", "/",
         "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
         ":", "?", "@",
@@ -44,7 +44,7 @@ namespace
         "ً", "ٌ", "ٍ", "َ", "ُ", "ِ", "ّ", "ْ", "ٓ", "ٔ", "ٰ", "ٱ",
         "ٹ", "پ", "چ", "ڈ", "ڑ", "ژ", "ک", "ڭ", "گ", "ں", "ھ", "ۀ", "ہ", "ۂ", "ۃ",
         "ۆ", "ۇ", "ۈ", "ۋ", "ی", "ې", "ے", "ۓ", "ە",
-        "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩","UNK"
+        "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩", "UNK"
     };
 #ifdef ARABIC_OCR_ONNX_ENABLED
     void CreateResizeModel(size_t num_channel, size_t width, size_t height)
@@ -317,11 +317,12 @@ namespace
 
         ~PPOCRv5() noexcept override = default;
 
-        std::vector<arabic_ocr::TextBox> BatchOCR(const std::vector<cv::Mat>& images) noexcept override
+        std::vector<std::vector<arabic_ocr::TextBox>> BatchOCR(const std::vector<cv::Mat>& images) noexcept override
         {
             if (images.empty()) return {};
             Ort::MemoryInfo input_mem_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator,
                                                                         OrtMemType::OrtMemTypeCPUInput);
+            std::vector<std::vector<arabic_ocr::TextBox>> ocr_result;
             for (auto& image : images)
             {
                 auto tensor{MatToTensorCHW(image, input_mem_info)};
@@ -375,75 +376,101 @@ namespace
                 // rec
                 {
                     auto last_boxes = vision_simple::VisionHelper::FilterByIOU(boxes, 0.5);
-                    auto width = align_up(std::ranges::max_element(
-                                              last_boxes, [](const auto& lhs, const auto& rhs)-> bool
-                                              {
-                                                  return lhs.width < rhs.width;
-                                              })->width, 320);
-                    auto height = 48;
+                    auto imgs = last_boxes | std::views::transform([&image](const cv::Rect& box)
                     {
-                        // images
-                        std::vector<int64_t> rec_shape{static_cast<int64_t>(last_boxes.size()), 3ull, height, width};
-
-                        Ort::AllocatorWithDefaultOptions allocator;
-                        Ort::Value rec_input_tensor = Ort::Value::CreateTensor(
-                            allocator, rec_shape.data(), rec_shape.size(),
-                            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
-                        auto dst = rec_input_tensor.GetTensorMutableData<float>();
-                        auto stride = width * height;
-                        for (auto [index,box] : std::views::enumerate(last_boxes))
-                        {
-                            auto img = LetterBox(image(box), {width, height});
-                            HWC2CHW_BGR2RGB(img, dst + stride * index);
-                        }
-                        rec_io_.BindInput("x", rec_input_tensor);
-                        rec_session_->Run(run_options, rec_io_);
-                    }
-                    // post process
-                    auto rec_outputs = rec_io_.GetOutputValues();
-                    auto& value = rec_outputs[0];
-                    auto info = value.GetTensorTypeAndShapeInfo();
-                    auto shape = info.GetShape();
-                    auto type = magic_enum::enum_name(info.GetElementType());
-                    auto ptr = value.GetTensorData<float>();
-                    auto stride = shape[1] * shape[2];
-                    std::vector<std::map<int, float>> result;
-                    for (auto i : std::views::iota(0, shape[0]))
+                        return image(box);
+                    }) | std::ranges::to<std::vector>();
+                    auto rec_results = BatchRec(imgs);
+                    std::vector<arabic_ocr::TextBox> result;
+                    for (auto [i,box] : std::views::enumerate(last_boxes))
                     {
-                        std::map<int, float> indices;
-                        auto it = indices.begin();
-                        auto img_ptr = ptr + i * stride;
-                        for (auto k : std::views::iota(0, shape[1]))
-                        {
-                            auto base_ptr = img_ptr + k * shape[2];
-                            auto idx = static_cast<int>(std::ranges::max_element(base_ptr, base_ptr + shape[2]) -
-                                base_ptr);
-                            auto conf = base_ptr[idx];
-                            it = indices.emplace_hint(it, idx, conf);
-                        }
-                        result.emplace_back(std::move(indices));
+                        auto& rec = rec_results[i];
+                        result.emplace_back(box.x, box.y, box.width, box.height, rec.confidence, rec.text);
                     }
-                    std::vector<arabic_ocr::TextBox> text_boxes;
-                    for (auto [i,m] : std::views::enumerate(result))
-                    {
-                        auto& box = last_boxes[i];
-                        for (auto it = m.begin(); it != m.end();)
-                        {
-                            if (it->second < 0.3f)
-                                it = m.erase(it);
-                            else
-                                ++it;
-                        }
-                        auto conf_view = m | std::views::transform([](auto& p) { return p.second; });
-                        auto avg_conf = std::accumulate(conf_view.begin(), conf_view.end(), 0.f) / conf_view.size();
-                        auto view = m | std::views::transform([](auto& p) { return dict[p.first]; });
-                        auto str = std::accumulate(view.begin(), view.end(), std::string{});
-                        arabic_ocr::TextBox text_box(box.x, box.y, box.width, box.height, avg_conf, str);
-                        text_boxes.emplace_back(std::move(text_box));
-                    }
-                    return text_boxes;
+                    ocr_result.emplace_back(result);
                 }
             }
+            return ocr_result;
+        }
+
+        std::vector<arabic_ocr::RecResult> BatchRec(const std::vector<cv::Mat>& images) noexcept override
+        {
+            auto height = this->model_shape_info.rec_input_height;
+            auto max_height = std::ranges::max_element(
+                images, [](const auto& lhs, const auto& rhs)-> bool
+                {
+                    return lhs.rows < rhs.rows;
+                })->rows;
+            auto scale = (float)height / (float)max_height;
+            auto width = align_up((int)(std::ranges::max_element(
+                                      images, [](const auto& lhs, const auto& rhs)-> bool
+                                      {
+                                          return lhs.cols < rhs.cols;
+                                      })->cols * scale), 320);
+            {
+                // images
+                std::vector<int64_t> rec_shape{
+                    static_cast<int64_t>(images.size()),
+                    this->model_shape_info.rec_input_num_channels, height, width
+                };
+
+                Ort::AllocatorWithDefaultOptions allocator;
+                Ort::Value rec_input_tensor = Ort::Value::CreateTensor(
+                    allocator, rec_shape.data(), rec_shape.size(),
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+                auto dst = rec_input_tensor.GetTensorMutableData<float>();
+                auto stride = width * height;
+                for (const auto& [index,image] : std::views::enumerate(images))
+                {
+                    auto img = LetterBox(image, {width, static_cast<int>(height)});
+                    HWC2CHW_BGR2RGB(img, dst + stride * index);
+                }
+                rec_io_.BindInput("x", rec_input_tensor);
+                Ort::RunOptions run_options{};
+                rec_session_->Run(run_options, rec_io_);
+            }
+            // post process
+            auto rec_outputs = rec_io_.GetOutputValues();
+            auto& value = rec_outputs[0];
+            auto info = value.GetTensorTypeAndShapeInfo();
+            auto shape = info.GetShape();
+            auto type = magic_enum::enum_name(info.GetElementType());
+            auto ptr = value.GetTensorData<float>();
+            auto stride = shape[1] * shape[2];
+            std::vector<std::vector<std::pair<int, float>>> result;
+            for (auto i : std::views::iota(0, shape[0]))
+            {
+                std::vector<std::pair<int, float>> indices;
+                auto img_ptr = ptr + i * stride;
+                for (auto k : std::views::iota(0, shape[1]))
+                {
+                    auto base_ptr = img_ptr + k * shape[2];
+                    auto idx = static_cast<int>(std::ranges::max_element(base_ptr, base_ptr + shape[2]) -
+                        base_ptr);
+                    auto conf = base_ptr[idx];
+                    // it = indices.emplace_hint(it, idx, conf);
+                    indices.emplace_back(idx, conf);
+                }
+                result.emplace_back(std::move(indices));
+            }
+            std::vector<arabic_ocr::RecResult> rec_results;
+            rec_results.reserve(result.size());
+            for (auto [i,v] : std::views::enumerate(result))
+            {
+                for (auto it = v.begin(); it != v.end();)
+                {
+                    if (it->second < 0.3f)
+                        it = v.erase(it);
+                    else
+                        ++it;
+                }
+                auto conf_view = v | std::views::transform([](auto& p) { return p.second; });
+                auto avg_conf = std::accumulate(conf_view.begin(), conf_view.end(), 0.f) / conf_view.size();
+                auto view = v | std::views::transform([](auto& p) { return REC_DICT[p.first]; });
+                auto str = std::accumulate(view.begin(), view.end(), std::string{});
+                rec_results.emplace_back(avg_conf, str);
+            }
+            return rec_results;
         }
 
     private:

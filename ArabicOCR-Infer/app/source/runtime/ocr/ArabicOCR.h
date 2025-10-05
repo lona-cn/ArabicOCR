@@ -79,6 +79,12 @@ namespace arabic_ocr
         std::string text;
     };
 
+    struct RecResult
+    {
+        float confidence;
+        std::string text;
+    };
+
     template <typename T, typename String = const char*>
         requires(std::convertible_to<String, std::string>)
     Result<T> MakeError(ErrorCode error_code, String&& msg = "")
@@ -128,6 +134,8 @@ namespace arabic_ocr
         virtual ~OCR() noexcept;
 
 
-        virtual std::vector<TextBox> BatchOCR(const std::vector<cv::Mat>& images) noexcept = 0;
+        virtual std::vector<std::vector<TextBox>> BatchOCR(const std::vector<cv::Mat>& images) noexcept = 0;
+
+        virtual std::vector<RecResult> BatchRec(const std::vector<cv::Mat>& images) noexcept = 0;
     };
 }
