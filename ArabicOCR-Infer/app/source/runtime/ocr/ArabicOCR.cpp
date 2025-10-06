@@ -390,10 +390,6 @@ namespace
                         output.GetTensorMutableData<float>()
                     };
                     DBPostProcessParams db_post_process_params;
-                    // cv::Mat output_u8_img;
-                    // output_img.convertTo(output_u8_img, CV_8UC1, 255.0);
-                    // std::vector<std::vector<cv::Point>> contours;
-                    // cv::findContours(output_u8_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
                     auto contours = DBPostProcess(pred_img, db_post_process_params);
 
                     boxes.reserve(contours.size());
@@ -412,7 +408,8 @@ namespace
                 });
                 // rec
                 {
-                    auto last_boxes = vision_simple::VisionHelper::FilterByIOU(boxes, 0.4);
+                    // auto last_boxes = vision_simple::VisionHelper::FilterByIOU(boxes, 0.3);
+                    auto &last_boxes = boxes;
                     auto imgs = last_boxes | std::views::transform([&image](const cv::Rect& box)
                     {
                         return image(box);
