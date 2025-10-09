@@ -363,15 +363,16 @@ namespace
                 auto tensor{MatToTensorCHW(image, input_mem_info)};
                 det_io_.BindInput("x", tensor);
                 try
-                {
-                    Ort::RunOptions run_options;
-                    det_session_->Run(run_options, det_io_);
-                }
-                catch (std::exception& _)
-                {
-                    //TODO: return Result instead empty container
-                    return {};
-                }
+            {
+                Ort::RunOptions run_options;
+                det_session_->Run(run_options, det_io_);
+            }
+            catch (std::exception& e)
+            {
+                // 记录异常信息并返回空结果
+                std::cerr << "OCR detection error: " << e.what() << std::endl;
+                return {};
+            }
                 std::vector<cv::Rect> boxes;
                 {
                     auto outputs = det_io_.GetOutputValues();
@@ -452,7 +453,16 @@ namespace
                 auto stride = width * height;
                 for (const auto& [index,image] : std::views::enumerate(images))
                 {
-                    auto img = LetterBox(image, {width, static_cast<int>(height)});
+                    cv::Mat img = LetterBox(image, {width, static_cast<int>(height)});
+                    if (!img.isContinuous()) img = img.clone();
+                    
+                    // 与Det阶段相同的归一化处理
+                    img.convertTo(img, img.type(), 1.0f / 255.f);
+                    cv::Scalar mean(0.485, 0.456, 0.406); // BGR 顺序
+                    cv::Scalar std(0.229, 0.224, 0.225);
+                    cv::subtract(img, mean, img);
+                    cv::divide(img, std, img);
+                    
                     HWC2CHW(img, dst + stride * index);
                 }
                 rec_io_.BindInput("x", rec_input_tensor);
@@ -494,7 +504,10 @@ namespace
                         ++it;
                 }
                 auto conf_view = v | std::views::transform([](auto& p) { return p.second; });
-                auto avg_conf = std::accumulate(conf_view.begin(), conf_view.end(), 0.f) / conf_view.size();
+                float avg_conf = 0.0f;
+                if (!conf_view.empty()) {
+                    avg_conf = std::accumulate(conf_view.begin(), conf_view.end(), 0.f) / conf_view.size();
+                }
                 auto view = v | std::views::transform([](auto& p) { return REC_DICT[p.first]; });
                 auto str = std::accumulate(view.begin(), view.end(), std::string{});
                 rec_results.emplace_back(avg_conf, str);
@@ -559,8 +572,8 @@ namespace
 
             // 1. 阈值化
             cv::Mat binary;
-            cv::threshold(pred, binary, params.bin_thresh, 255., cv::THRESH_BINARY);
-            binary.convertTo(binary, CV_8UC1);
+            cv::threshold(pred, binary, params.bin_thresh, 1., cv::THRESH_BINARY);  // 使用1作为最大值，因为pred是0-1范围的float
+            binary.convertTo(binary, CV_8UC1, 255);  // 转换为0-255范围的8位图像
 
             // 2. 找轮廓
             std::vector<std::vector<cv::Point>> contours;
@@ -629,7 +642,8 @@ arabic_ocr::Result<std::unique_ptr<arabic_ocr::OCR>> arabic_ocr::OCR::Create(Inf
                                                                              std::span<const uint8_t> rec_model_data)
     noexcept
 {
-    auto& ort_infer_ctx = dynamic_cast<InferContextOrt&>(infer_ctx);
+    try {
+            auto& ort_infer_ctx = dynamic_cast<InferContextOrt&>(infer_ctx);
     auto det_result = ort_infer_ctx.CreateSession(det_model_data,
                                                   std::numeric_limits<std::size_t>::max());
     if (!det_result)return std::unexpected(std::move(det_result.error()));
@@ -637,6 +651,9 @@ arabic_ocr::Result<std::unique_ptr<arabic_ocr::OCR>> arabic_ocr::OCR::Create(Inf
                                                   std::numeric_limits<std::size_t>::max());
     if (!rec_result)return std::unexpected(std::move(rec_result.error()));
     return PPOCRv5::Create(std::move(det_result.value()), std::move(rec_result.value()));
+        } catch (const std::bad_cast&) {
+            return MakeError<std::unique_ptr<OCR>>(ErrorCode::kRuntimeError, "InferContext type mismatch");
+        }
 }
 
 arabic_ocr::Result<std::unique_ptr<arabic_ocr::OCR>> arabic_ocr::OCR::Create(InferContext& infer_ctx,
@@ -658,7 +675,7 @@ arabic_ocr::Result<std::unique_ptr<arabic_ocr::OCR>> arabic_ocr::OCR::Create(Inf
     if (ec)
     {
         return MakeError<std::unique_ptr<OCR>>(ErrorCode::kIOError,
-                                               std::format("unable to mmap det_model_path:{}", ec.message()));
+                                               std::format("unable to mmap rec_model_path:{}", ec.message()));
     }
     auto rec_mmap = mio::make_mmap_source(rec_model_path, ec);
     if (ec)
