@@ -44,7 +44,7 @@ namespace
         "ً", "ٌ", "ٍ", "َ", "ُ", "ِ", "ّ", "ْ", "ٓ", "ٔ", "ٰ", "ٱ",
         "ٹ", "پ", "چ", "ڈ", "ڑ", "ژ", "ک", "ڭ", "گ", "ں", "ھ", "ۀ", "ہ", "ۂ", "ۃ",
         "ۆ", "ۇ", "ۈ", "ۋ", "ی", "ې", "ے", "ۓ", "ە",
-        "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩", "UNK"
+        "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩", ""
     };
 #ifdef ARABIC_OCR_ONNX_ENABLED
     void CreateResizeModel(size_t num_channel, size_t width, size_t height)
@@ -64,9 +64,9 @@ namespace
     struct DBPostProcessParams
     {
         float bin_thresh = 0.3f; // 二值化阈值 (thresh)
-        float box_thresh = 0.6f; // 框置信度阈值
+        float box_thresh = 0.75f; // 框置信度阈值
         int max_candidates = 1000; // 最大候选框
-        float unclip_ratio = 1.5f; // 膨胀因子 (unclip_ratio)
+        float unclip_ratio = 1.6f; // 膨胀因子 (unclip_ratio)
     };
 
     cv::Mat LetterBox(const cv::Mat& image, const cv::Size new_shape,
@@ -367,9 +367,10 @@ namespace
                     Ort::RunOptions run_options;
                     det_session_->Run(run_options, det_io_);
                 }
-                catch (std::exception& err)
+                catch (std::exception& _)
                 {
-                    throw;
+                    //TODO: return Result instead empty container
+                    return {};
                 }
                 std::vector<cv::Rect> boxes;
                 {
@@ -389,7 +390,7 @@ namespace
                         cv::Size{static_cast<int>(shape[3]), static_cast<int>(shape[2])},CV_32FC1,
                         output.GetTensorMutableData<float>()
                     };
-                    DBPostProcessParams db_post_process_params;
+                    DBPostProcessParams db_post_process_params{};
                     auto contours = DBPostProcess(pred_img, db_post_process_params);
 
                     boxes.reserve(contours.size());
@@ -402,13 +403,8 @@ namespace
                             boxes.emplace_back(origin_box);
                     }
                 }
-                std::ranges::sort(boxes, [](const auto& lhs, const auto& rhs)
-                {
-                    return lhs.area() > rhs.area();
-                });
                 // rec
                 {
-                    // auto last_boxes = vision_simple::VisionHelper::FilterByIOU(boxes, 0.3);
                     auto &last_boxes = boxes;
                     auto imgs = last_boxes | std::views::transform([&image](const cv::Rect& box)
                     {
